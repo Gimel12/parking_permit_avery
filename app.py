@@ -60,7 +60,7 @@ def save_json(path: Path, data: dict):
 
 def load_schedule() -> dict:
     """Load schedule config. Defaults to every 2 days at 6:00 AM, disabled."""
-    defaults = {"enabled": False, "every_days": 2, "hour": 6, "minute": 0}
+    defaults = {"enabled": False, "every_days": 2, "hour": 6, "minute": 0, "start_date": ""}
     data = load_json(SCHEDULE_FILE)
     return {**defaults, **data}
 
@@ -111,18 +111,32 @@ def sync_scheduler():
 
     sched = load_schedule()
     if sched.get("enabled"):
+        from datetime import timedelta
         every = max(1, sched.get("every_days", 2))
-        if every == 1:
-            # Daily: use cron trigger
-            trigger = CronTrigger(hour=sched["hour"], minute=sched["minute"])
+        hour = sched["hour"]
+        minute = sched["minute"]
+
+        # Determine the anchor start date
+        now = datetime.now()
+        if sched.get("start_date"):
+            try:
+                start = datetime.strptime(sched["start_date"], "%Y-%m-%d")
+                start = start.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            except ValueError:
+                start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         else:
-            # Every N days: use interval trigger, aligned to the chosen time
-            from datetime import timedelta
-            now = datetime.now()
-            start = now.replace(hour=sched["hour"], minute=sched["minute"], second=0, microsecond=0)
-            if start <= now:
-                start += timedelta(days=1)
+            start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+        # If start is in the past, advance by intervals until it's in the future
+        if start <= now:
+            intervals_passed = int((now - start).total_seconds() / (every * 86400)) + 1
+            start += timedelta(days=every * intervals_passed)
+
+        if every == 1:
+            trigger = CronTrigger(hour=hour, minute=minute)
+        else:
             trigger = IntervalTrigger(days=every, start_date=start)
+
         scheduler.add_job(
             run_permit_job,
             trigger=trigger,
@@ -130,7 +144,7 @@ def sync_scheduler():
             kwargs={"source": "scheduled"},
             replace_existing=True,
         )
-        log.info("Scheduler set: every %d day(s) at %02d:%02d", every, sched["hour"], sched["minute"])
+        log.info("Scheduler set: every %d day(s) at %02d:%02d, anchored to %s", every, hour, minute, start.strftime("%Y-%m-%d %H:%M"))
     else:
         log.info("Scheduler disabled.")
 
@@ -238,12 +252,14 @@ TEMPLATE = """
     color: var(--muted); max-height: 350px; overflow-y: auto;
   }
 
-  .screenshots { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
-  .screenshots img {
-    max-width: 180px; border-radius: 8px; border: 1px solid var(--border);
+  .screenshots { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 10px; }
+  .screenshot-item { text-align: center; max-width: 180px; }
+  .screenshot-item img {
+    width: 180px; border-radius: 8px; border: 1px solid var(--border);
     cursor: pointer; transition: transform 0.2s;
   }
-  .screenshots img:hover { transform: scale(1.05); }
+  .screenshot-item img:hover { transform: scale(1.05); }
+  .screenshot-date { color: var(--muted); font-size: 0.78rem; margin-top: 6px; }
 
   .flash {
     padding: 12px 16px; border-radius: 8px; margin-bottom: 16px;
@@ -347,16 +363,22 @@ TEMPLATE = """
     </div>
     <div class="row">
       <div>
-        <label>Run every N days</label>
+        <label>Run every</label>
         <select name="every_days">
           <option value="1" {{ 'selected' if schedule.every_days == 1 }}>Every day</option>
-          <option value="2" {{ 'selected' if schedule.every_days == 2 }}>Every 2 days</option>
+          <option value="2" {{ 'selected' if schedule.every_days == 2 }}>Every 2 days (48h)</option>
           <option value="3" {{ 'selected' if schedule.every_days == 3 }}>Every 3 days</option>
           <option value="4" {{ 'selected' if schedule.every_days == 4 }}>Every 4 days</option>
           <option value="5" {{ 'selected' if schedule.every_days == 5 }}>Every 5 days</option>
           <option value="7" {{ 'selected' if schedule.every_days == 7 }}>Every 7 days</option>
         </select>
       </div>
+      <div>
+        <label>First run date</label>
+        <input type="date" name="start_date" value="{{ schedule.start_date }}" style="width:100%;padding:10px 12px;background:var(--card2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.95rem;margin-bottom:12px;">
+      </div>
+    </div>
+    <div class="row">
       <div>
         <label>Hour (0–23)</label>
         <input type="number" name="hour" min="0" max="23" value="{{ schedule.hour }}">
@@ -365,9 +387,9 @@ TEMPLATE = """
         <label>Minute (0–59)</label>
         <input type="number" name="minute" min="0" max="59" value="{{ schedule.minute }}">
       </div>
-    </div>
-    <div style="margin-top:4px">
-      <button type="submit" class="btn btn-primary btn-sm">Save Schedule</button>
+      <div style="padding-bottom:12px">
+        <button type="submit" class="btn btn-primary btn-sm">Save Schedule</button>
+      </div>
     </div>
   </form>
 </div>
@@ -403,11 +425,24 @@ TEMPLATE = """
 <!-- Screenshots -->
 <div class="card" style="margin-bottom:16px">
   <h2>Latest Screenshots</h2>
+  {% if screenshots %}
+  <div style="margin-bottom:10px">
+    <form method="POST" action="/screenshots/delete-all" onsubmit="return confirm('Delete ALL screenshots?')">
+      <button type="submit" class="btn btn-red btn-sm">🗑 Delete All</button>
+    </form>
+  </div>
+  {% endif %}
   <div class="screenshots">
     {% for img in screenshots %}
-      <a href="/screenshot/{{ img.name }}" target="_blank">
-        <img src="/screenshot/{{ img.name }}" alt="{{ img.name }}" title="{{ img.name }}">
-      </a>
+      <div class="screenshot-item">
+        <a href="/screenshot/{{ img.name }}" target="_blank">
+          <img src="/screenshot/{{ img.name }}" alt="{{ img.name }}">
+        </a>
+        <div class="screenshot-date">{{ img.date }}</div>
+        <form method="POST" action="/screenshots/delete/{{ img.name }}" style="margin-top:4px">
+          <button type="submit" class="btn btn-red btn-sm" style="width:100%;padding:4px 8px;font-size:0.75rem;">✕ Delete</button>
+        </form>
+      </div>
     {% else %}
       <span style="color:var(--muted)">No screenshots yet. Run the permit to generate them.</span>
     {% endfor %}
@@ -460,9 +495,18 @@ def index():
     log_map = {"permit": "permit.log", "app": "app.log", "watchdog": "watchdog.log"}
     log_content = get_log_tail(log_map.get(active_log, "permit.log"), lines=40)
 
-    # Latest screenshots (last 6)
+    # Latest screenshots with parsed dates
     pngs = sorted(BASE.glob("result_*.png"), key=lambda p: p.stat().st_mtime)
-    screenshots = pngs[-6:]
+    screenshots = []
+    for p in pngs:
+        # Parse date from filename like result_20260315_190628.png
+        parts = p.stem.replace("result_", "")
+        try:
+            dt = datetime.strptime(parts, "%Y%m%d_%H%M%S")
+            date_str = dt.strftime("%b %d, %Y  %I:%M %p")
+        except ValueError:
+            date_str = parts
+        screenshots.append({"name": p.name, "date": date_str})
 
     # Flash messages via query param
     flash = None
@@ -475,6 +519,10 @@ def index():
         flash = {"type": "success", "msg": "✅ Credentials saved."}
     elif fm == "already_running":
         flash = {"type": "error", "msg": "⚠️ A permit job is already running. Please wait."}
+    elif fm == "deleted":
+        flash = {"type": "success", "msg": "🗑 Screenshot deleted."}
+    elif fm == "deleted_all":
+        flash = {"type": "success", "msg": "🗑 All screenshots deleted."}
 
     return render_template_string(
         TEMPLATE,
@@ -507,6 +555,7 @@ def update_schedule():
         "every_days": int(request.form.get("every_days", 2)),
         "hour": int(request.form.get("hour", 6)),
         "minute": int(request.form.get("minute", 0)),
+        "start_date": request.form.get("start_date", ""),
     }
     save_schedule(data)
     sync_scheduler()
@@ -528,6 +577,27 @@ def update_config():
 def screenshot(filename):
     from flask import send_from_directory
     return send_from_directory(str(BASE), filename)
+
+
+@app.route("/screenshots/delete/<filename>", methods=["POST"])
+def delete_screenshot(filename):
+    """Delete a single screenshot."""
+    path = BASE / filename
+    if path.exists() and path.suffix == ".png" and path.parent == BASE:
+        path.unlink()
+        log.info("Deleted screenshot: %s", filename)
+    return redirect(url_for("index", flash="deleted"))
+
+
+@app.route("/screenshots/delete-all", methods=["POST"])
+def delete_all_screenshots():
+    """Delete all result screenshots."""
+    count = 0
+    for p in BASE.glob("result_*.png"):
+        p.unlink()
+        count += 1
+    log.info("Deleted %d screenshots", count)
+    return redirect(url_for("index", flash="deleted_all"))
 
 
 @app.route("/api/status")
