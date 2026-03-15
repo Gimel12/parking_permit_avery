@@ -1,0 +1,17 @@
+# Secrets
+config.json
+
+# State & schedule (local to each machine)
+state.json
+schedule.json
+
+# Logs
+*.log
+
+# Screenshots
+*.png
+
+# Python
+__pycache__/
+*.pyc
+.venv/
