@@ -5,6 +5,7 @@ Dashboard to configure, schedule, and monitor permit automation.
 Telegram used for outbound notifications only (no polling).
 """
 
+import functools
 import json
 import logging
 import sys
@@ -15,7 +16,7 @@ from pathlib import Path
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from flask import Flask, jsonify, redirect, render_template_string, request, url_for
+from flask import Flask, Response, jsonify, redirect, render_template_string, request, url_for
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 BASE = Path(__file__).parent
@@ -42,6 +43,30 @@ scheduler.start()
 
 # Lock to prevent overlapping permit runs
 permit_lock = threading.Lock()
+
+
+# ── Basic Auth ────────────────────────────────────────────────────────────────
+
+def check_auth(username: str, password: str) -> bool:
+    """Verify credentials against config.json app_username/app_password."""
+    cfg = load_json(CONFIG_FILE)
+    valid_user = cfg.get("app_username", "admin")
+    valid_pass = cfg.get("app_password", "parking")
+    return username == valid_user and password == valid_pass
+
+
+def auth_required(f):
+    """Decorator that enforces HTTP Basic Auth on a route."""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return Response(
+                "Login required.", 401,
+                {"WWW-Authenticate": 'Basic realm="Parking Permit"'},
+            )
+        return f(*args, **kwargs)
+    return decorated
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -470,6 +495,7 @@ TEMPLATE = """
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
+@auth_required
 def index():
     config = load_json(CONFIG_FILE)
     state = get_state()
@@ -539,6 +565,7 @@ def index():
 
 
 @app.route("/run", methods=["POST"])
+@auth_required
 def run_now():
     if permit_lock.locked():
         return redirect(url_for("index", flash="already_running"))
@@ -549,6 +576,7 @@ def run_now():
 
 
 @app.route("/schedule", methods=["POST"])
+@auth_required
 def update_schedule():
     data = {
         "enabled": "enabled" in request.form,
@@ -563,6 +591,7 @@ def update_schedule():
 
 
 @app.route("/config", methods=["POST"])
+@auth_required
 def update_config():
     config = load_json(CONFIG_FILE)
     config["username"] = request.form.get("username", config.get("username", ""))
@@ -574,12 +603,14 @@ def update_config():
 
 
 @app.route("/screenshot/<filename>")
+@auth_required
 def screenshot(filename):
     from flask import send_from_directory
     return send_from_directory(str(BASE), filename)
 
 
 @app.route("/screenshots/delete/<filename>", methods=["POST"])
+@auth_required
 def delete_screenshot(filename):
     """Delete a single screenshot."""
     path = BASE / filename
@@ -590,6 +621,7 @@ def delete_screenshot(filename):
 
 
 @app.route("/screenshots/delete-all", methods=["POST"])
+@auth_required
 def delete_all_screenshots():
     """Delete all result screenshots."""
     count = 0
@@ -601,6 +633,7 @@ def delete_all_screenshots():
 
 
 @app.route("/api/status")
+@auth_required
 def api_status():
     """JSON endpoint for external checks."""
     state = get_state()
